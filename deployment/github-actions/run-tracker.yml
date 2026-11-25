@@ -1,0 +1,79 @@
+name: SB Link Tracker session
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'How long to run (minutes)'
+        required: false
+        default: '60'
+        type: choice
+        options: ['15','30','60','120','180','240','300','330']
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  tracker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DURATION: ${{ inputs.duration_minutes || '60' }}
+      ADMIN_KEY: ${{ secrets.SB_TRACKER_ADMIN_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Start tracker server
+        run: |
+          nohup python3 app.py > server.log 2>&1 &
+          sleep 3
+          curl -s -o /dev/null -w "dashboard http=%{http_code}\n" "http://127.0.0.1:8790/?key=$ADMIN_KEY" || true
+
+      - name: Start Cloudflare quick tunnel
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --url http://127.0.0.1:8790 > tunnel.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$URL" ]; then echo "PUBLIC_URL=$URL" >> "$GITHUB_ENV"; break; fi
+            sleep 2
+          done
+          echo "PUBLIC_URL=${PUBLIC_URL:-not-ready}"
+
+      - name: Write public URL to summary
+        run: |
+          {
+            echo "## SB Link Tracker is live"
+            echo ""
+            echo "Public URL: ${PUBLIC_URL:-not ready - check tunnel.log}"
+            echo "Dashboard: ${PUBLIC_URL}/?key=<your ADMIN_KEY>"
+            echo ""
+            echo "Duration: $DURATION minutes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep session alive
+        run: |
+          echo "Running for $DURATION minutes..."
+          sleep $((DURATION * 60))
+
+      - name: Save click data
+        if: always()
+        run: |
+          test -f data.db && ls -lh data.db || echo "No data.db (no clicks / server never wrote it)"
+
+      - name: Upload tracker data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracker-data
+          path: |
+            data.db
+            server.log
+            tunnel.log
+          if-no-files-found: warn
