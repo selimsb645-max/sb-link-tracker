@@ -1,0 +1,67 @@
+name: SB Link Tracker session
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How many minutes the server runs (max 330)"
+        required: false
+        default: "60"
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download cloudflared (free quick tunnel)
+        run: |
+          curl -sL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+
+      - name: Start tracker + tunnel
+        env:
+          ADMIN_KEY: ${{ secrets.SB_TRACKER_ADMIN_KEY }}
+          PORT: "8790"
+        run: |
+          if [ -z "$ADMIN_KEY" ]; then echo "::warning::SB_TRACKER_ADMIN_KEY secret is not set - dashboard will be open, set the secret"; fi
+          nohup python3 app.py > tracker.log 2>&1 &
+          sleep 2
+          nohup ./cloudflared tunnel --url http://127.0.0.1:8790 --no-autoupdate > tunnel.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel.log | head -1)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          echo "=================================================="
+          echo "PUBLIC TRACKER URL: $URL"
+          echo "Dashboard: $URL/"
+          echo "=================================================="
+          {
+            echo "## SB Link Tracker is running"
+            echo ""
+            echo "Public URL: $URL"
+            echo ""
+            echo "Dashboard: $URL/"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep alive
+        run: |
+          D="${{ inputs.duration_minutes }}"
+          case "$D" in ''|*[!0-9]*) D=60;; esac
+          if [ "$D" -gt 330 ]; then D=330; fi
+          echo "Sleeping ${D} minutes..."
+          sleep $((D * 60))
+
+      - name: Save click data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracker-data
+          path: data.db
+          if-no-files-found: ignore
