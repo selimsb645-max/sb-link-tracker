@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 """
-SB Link Tracker — ওয়েবসাইট সংস্করণ (v3, প্রিমিয়াম UI)
+SB Link Tracker — ওয়েবসাইট সংস্করণ (v4, WSGI + প্রিমিয়াম UI)
 নিজের শেয়ার করা লিংকের ক্লিক অ্যানালিটিক্স, পাসওয়ার্ড-সুরক্ষিত ড্যাশবোর্ডসহ।
 
+- একই ফাইল দুইভাবে চলে:
+  * PythonAnywhere: WSGI `application` (24/7 হোস্টিং)
+  * সরাসরি: `python3 app.py` (GitHub Actions সেশন / লোকাল)
 - ওয়েবসাইটে ঢুকতে পাসওয়ার্ড লাগে (লগইন পেজ `/login`)।
-  পাসওয়ার্ড আসে ADMIN_KEY env থেকে (GitHub Actions-এ repo secret
-  SB_TRACKER_ADMIN_KEY)। ADMIN_KEY না থাকলে ড্যাশবোর্ড বন্ধ থাকে।
+  পাসওয়ার্ড আসে ADMIN_KEY env থেকে। ADMIN_KEY না থাকলে ড্যাশবোর্ড বন্ধ থাকে।
 - লগইনের পর সেশন কুকি (HMAC-সাইন করা, 12 ঘণ্টা) দিয়ে ঢোকা থাকে।
 - ট্র্যাকিং লিংক `/t/<code>` সবার জন্য খোলা — ওটাই এর কাজ।
   ক্লিকে IP, দেশ/শহর (ফ্রি ip-api), ISP, ব্রাউজার, OS, সময় লগ হয়,
   তারপর আসল লিংকে রিডাইরেক্ট (302) হয়।
 
 শুধু Python stdlib — কোনো পেইড API / প্যাকেজ নেই।
-চালানো:  ADMIN_KEY=... PORT=8790 python3 app.py
 """
 import os, json, sqlite3, secrets, string, hmac, hashlib, time, urllib.request, urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(BASE, "data.db")
 PORT = int(os.environ.get("PORT", "8790"))
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 SESSION_TTL = 12 * 3600
+
+def admin_key():
+    return os.environ.get("ADMIN_KEY", "")
 
 CSS = """
 *{box-sizing:border-box}
@@ -102,91 +104,122 @@ def esc(s): return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(
 
 def make_token():
     exp = str(int(time.time()) + SESSION_TTL)
-    sig = hmac.new(ADMIN_KEY.encode(), exp.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(admin_key().encode(), exp.encode(), hashlib.sha256).hexdigest()
     return f"{exp}.{sig}"
 
 def valid_token(tok: str):
-    if not tok or "." not in tok or not ADMIN_KEY: return False
-    exp, sig = tok.split(".", 1)
-    if int(exp) < int(time.time()): return False
-    good = hmac.new(ADMIN_KEY.encode(), exp.encode(), hashlib.sha256).hexdigest()
+    if not tok or "." not in tok or not admin_key(): return False
+    try:
+        exp, sig = tok.split(".", 1)
+        if int(exp) < int(time.time()): return False
+    except Exception:
+        return False
+    good = hmac.new(admin_key().encode(), exp.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, good)
 
 def page(title, body):
     return f"<!doctype html><html lang=bn><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{esc(title)} · SB Link Tracker</title><style>{CSS}</style></head><body>{body}</body></html>"
 
-class H(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def send_html(self, html, code=200, headers=None):
-        b = html.encode(); self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", len(b))
-        for k, v in (headers or {}).items(): self.send_header(k, v)
-        self.end_headers(); self.wfile.write(b)
-    def redirect(self, to, headers=None):
-        self.send_response(302); self.send_header("Location", to)
-        for k, v in (headers or {}).items(): self.send_header(k, v)
-        self.end_headers()
-    def session(self):
-        for part in (self.headers.get("Cookie", "") or "").split(";"):
-            part = part.strip()
-            if part.startswith("sb_session="): return valid_token(part[len("sb_session="):])
-        return False
-    def form(self):
-        n = int(self.headers.get("Content-Length", 0))
-        return urllib.parse.parse_qs(self.rfile.read(n).decode()) if n else {}
+def html_resp(body, status="200 OK", extra=None):
+    b = body.encode()
+    h = [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(b)))] + (extra or [])
+    return status, h, [b]
 
-    def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path.startswith("/t/"):
-            code = path[3:].strip("/")
-            c = db(); row = c.execute("SELECT url FROM links WHERE code=?", (code,)).fetchone()
-            if not row: c.close(); return self.send_html(page("Not found", "<div class=wrap><div class=card><h3>লিংক পাওয়া যায়নি</h3></div></div>"), 404)
-            ip = (self.headers.get("CF-Connecting-IP", "").strip()
-                  or self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-                  or self.client_address[0])
-            ua = self.headers.get("User-Agent", ""); br, os_ = parse_ua(ua)
-            country, city, isp = geo(ip)
-            c.execute("INSERT INTO clicks(code,ts,ip,country,city,isp,browser,os,ua,referer) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                      (code, datetime.now(timezone.utc).isoformat(), ip, country, city, isp, br, os_, ua, self.headers.get("Referer", "")))
-            c.commit(); c.close()
-            return self.redirect(row["url"])
-        if path == "/login":
-            if not ADMIN_KEY:
-                return self.send_html(page("Setup", "<div class=wrap><div class=loginbox><div class=icon>🔒</div><h1>SB Link Tracker</h1><p>এই ওয়েবসাইটে এখনো পাসওয়ার্ড সেট করা হয়নি।<br>সার্ভারে ADMIN_KEY সেট করলেই লগইন চালু হবে।</p></div></div>"))
-            if self.session(): return self.redirect("/")
-            err = "<div class=err>পাসওয়ার্ড মেলেনি — আবার চেষ্টা করো</div>" if "e=1" in self.path else ""
-            return self.send_html(page("Login", f"""<div class=wrap><div class=loginbox><div class=icon>🔗</div>
+def redirect_resp(to, extra=None):
+    return "302 Found", [("Location", to)] + (extra or []), [b""]
+
+def json_resp(obj, status="200 OK"):
+    b = json.dumps(obj, ensure_ascii=False).encode()
+    return status, [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(b)))], [b]
+
+def api_authorized(env):
+    key = env.get("HTTP_X_API_KEY", "")
+    return bool(admin_key()) and hmac.compare_digest(key, admin_key())
+
+def api_handle(env, method, path):
+    """Telegram বটের জন্য ছোট্ট JSON API — X-API-Key হেডারে ADMIN_KEY লাগে।"""
+    if not api_authorized(env):
+        return json_resp({"error": "unauthorized"}, "401 Unauthorized")
+    c = db()
+    if method == "POST" and path == "/api/create":
+        try: n = int(env.get("CONTENT_LENGTH") or 0)
+        except Exception: n = 0
+        try: data = json.loads(env["wsgi.input"].read(n).decode() or "{}")
+        except Exception: data = {}
+        url = (data.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            c.close(); return json_resp({"error": "valid http/https url required"}, "400 Bad Request")
+        code = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(6))
+        c.execute("INSERT INTO links VALUES(?,?,?)", (code, url, datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
+        host = env.get("HTTP_HOST", "localhost")
+        scheme = "https" if (env.get("HTTP_X_FORWARDED_PROTO") == "https" or "https" in env.get("HTTP_CF_VISITOR", "")) else "http"
+        return json_resp({"code": code, "link": f"{scheme}://{host}/t/{code}", "url": url})
+    if method == "GET" and path == "/api/links":
+        rows = c.execute("""SELECT l.code, l.url, l.created, (SELECT COUNT(*) FROM clicks k WHERE k.code=l.code) AS n
+                            FROM links l ORDER BY l.created DESC LIMIT 100""").fetchall()
+        c.close(); return json_resp({"links": [dict(r) for r in rows]})
+    if method == "GET" and path == "/api/clicks":
+        q = urllib.parse.parse_qs(env.get("QUERY_STRING", ""))
+        try: after = int(q.get("after", ["0"])[0])
+        except Exception: after = 0
+        rows = c.execute("""SELECT k.id, k.code, k.ts, k.ip, k.country, k.city, k.isp, k.browser, k.os, l.url
+                            FROM clicks k LEFT JOIN links l ON l.code=k.code
+                            WHERE k.id>? ORDER BY k.id ASC LIMIT 100""", (after,)).fetchall()
+        c.close(); return json_resp({"clicks": [dict(r) for r in rows]})
+    if method == "GET" and path == "/api/stats":
+        s = {"links": c.execute("SELECT COUNT(*) n FROM links").fetchone()["n"],
+             "clicks": c.execute("SELECT COUNT(*) n FROM clicks").fetchone()["n"],
+             "unique_ips": c.execute("SELECT COUNT(DISTINCT ip) n FROM clicks").fetchone()["n"],
+             "max_click_id": c.execute("SELECT COALESCE(MAX(id),0) n FROM clicks").fetchone()["n"]}
+        c.close(); return json_resp(s)
+    c.close()
+    return json_resp({"error": "not found"}, "404 Not Found")
+
+def get_session(env):
+    for part in (env.get("HTTP_COOKIE", "") or "").split(";"):
+        part = part.strip()
+        if part.startswith("sb_session="): return valid_token(part[len("sb_session="):])
+    return False
+
+def read_form(env):
+    try: n = int(env.get("CONTENT_LENGTH") or 0)
+    except Exception: n = 0
+    if not n: return {}
+    return urllib.parse.parse_qs(env["wsgi.input"].read(n).decode())
+
+def login_page(env):
+    if not admin_key():
+        return html_resp(page("Setup", "<div class=wrap><div class=loginbox><div class=icon>🔒</div><h1>SB Link Tracker</h1><p>এই ওয়েবসাইটে এখনো পাসওয়ার্ড সেট করা হয়নি।<br>সার্ভারে ADMIN_KEY সেট করলেই লগইন চালু হবে।</p></div></div>"))
+    err = "<div class=err>পাসওয়ার্ড মেলেনি — আবার চেষ্টা করো</div>" if "e=1" in env.get("QUERY_STRING", "") else ""
+    return html_resp(page("Login", f"""<div class=wrap><div class=loginbox><div class=icon>🔗</div>
 <h1>SB <span style="background:linear-gradient(90deg,#38bdf8,#818cf8);-webkit-background-clip:text;background-clip:text;color:transparent">Link Tracker</span></h1><p>ওয়েবসাইটে ঢুকতে পাসওয়ার্ড দাও</p>{err}
 <form method=POST action=/login><input type=password name=password placeholder="পাসওয়ার্ড" required autofocus>
 <div style="height:14px"></div><button style="width:100%">প্রবেশ করো →</button></form>
 <p style="margin-bottom:0"><small>নিজের লিংকের ক্লিক অ্যানালিটিক্স — SB Digital Studio</small></p></div></div>"""))
-        if path == "/logout":
-            return self.redirect("/login", {"Set-Cookie": "sb_session=; Path=/; Max-Age=0; HttpOnly"})
-        if path in ("/", "/dashboard"):
-            if not ADMIN_KEY:
-                return self.send_html(page("Setup", "<div class=wrap><div class=loginbox><div class=icon>🔒</div><h1>SB Link Tracker</h1><p>পাসওয়ার্ড সেট করা হয়নি — ADMIN_KEY সেট করলে ওয়েবসাইট চালু হবে।</p></div></div>"))
-            if not self.session(): return self.redirect("/login")
-            c = db()
-            links = c.execute("""SELECT l.*, (SELECT COUNT(*) FROM clicks k WHERE k.code=l.code) AS n
-                                 FROM links l ORDER BY l.created DESC""").fetchall()
-            clicks = c.execute("SELECT * FROM clicks ORDER BY id DESC LIMIT 200").fetchall()
-            n_links = c.execute("SELECT COUNT(*) n FROM links").fetchone()["n"]
-            n_clicks = c.execute("SELECT COUNT(*) n FROM clicks").fetchone()["n"]
-            n_ip = c.execute("SELECT COUNT(DISTINCT ip) n FROM clicks").fetchone()["n"]
-            top = c.execute("SELECT country, COUNT(*) n FROM clicks WHERE country<>'' GROUP BY country ORDER BY n DESC LIMIT 1").fetchone()
-            c.close()
-            host = self.headers.get("Host", "localhost"); scheme = "https" if self.headers.get("CF-Visitor", "").find("https") >= 0 or self.headers.get("X-Forwarded-Proto") == "https" else "http"
-            rows = "".join(f"<tr><td style='white-space:nowrap'>{r['ts'][:19].replace('T',' ')}</td><td>/{esc(r['code'])}</td><td><code>{esc(r['ip'])}</code></td><td>{esc(r['country'])}<br><small>{esc(r['city'])}</small></td><td>{esc(r['isp'])}</td><td>{esc(r['browser'])}</td><td>{esc(r['os'])}</td></tr>" for r in clicks)
-            lrows = ""
-            for l in links:
-                full = f"{scheme}://{host}/t/{l['code']}"
-                lrows += (f"<tr><td><code>{esc(full)}</code></td>"
-                          f"<td><button type=button class=ghost onclick=\"cp(this,'{esc(full)}')\">কপি</button></td>"
-                          f"<td style='word-break:break-all'>{esc(l['url'])}</td>"
-                          f"<td><span class=pill>{l['n']}</span></td>"
-                          f"<td style='white-space:nowrap'>{esc(l['created'][:10])}</td></tr>")
-            msg = "<div class=ok>✓ নতুন ট্র্যাকিং লিংক তৈরি হয়েছে — তালিকা থেকে কপি করে শেয়ার করো</div>" if "made=1" in self.path else ""
-            return self.send_html(page("Dashboard", f"""<div class=wrap>
+
+def dashboard(env):
+    c = db()
+    links = c.execute("""SELECT l.*, (SELECT COUNT(*) FROM clicks k WHERE k.code=l.code) AS n
+                         FROM links l ORDER BY l.created DESC""").fetchall()
+    clicks = c.execute("SELECT * FROM clicks ORDER BY id DESC LIMIT 200").fetchall()
+    n_links = c.execute("SELECT COUNT(*) n FROM links").fetchone()["n"]
+    n_clicks = c.execute("SELECT COUNT(*) n FROM clicks").fetchone()["n"]
+    n_ip = c.execute("SELECT COUNT(DISTINCT ip) n FROM clicks").fetchone()["n"]
+    top = c.execute("SELECT country, COUNT(*) n FROM clicks WHERE country<>'' GROUP BY country ORDER BY n DESC LIMIT 1").fetchone()
+    c.close()
+    host = env.get("HTTP_HOST", "localhost")
+    scheme = "https" if (env.get("HTTP_X_FORWARDED_PROTO") == "https" or "https" in env.get("HTTP_CF_VISITOR", "")) else "http"
+    rows = "".join(f"<tr><td style='white-space:nowrap'>{r['ts'][:19].replace('T',' ')}</td><td>/{esc(r['code'])}</td><td><code>{esc(r['ip'])}</code></td><td>{esc(r['country'])}<br><small>{esc(r['city'])}</small></td><td>{esc(r['isp'])}</td><td>{esc(r['browser'])}</td><td>{esc(r['os'])}</td></tr>" for r in clicks)
+    lrows = ""
+    for l in links:
+        full = f"{scheme}://{host}/t/{l['code']}"
+        lrows += (f"<tr><td><code>{esc(full)}</code></td>"
+                  f"<td><button type=button class=ghost onclick=\"cp(this,'{esc(full)}')\">কপি</button></td>"
+                  f"<td style='word-break:break-all'>{esc(l['url'])}</td>"
+                  f"<td><span class=pill>{l['n']}</span></td>"
+                  f"<td style='white-space:nowrap'>{esc(l['created'][:10])}</td></tr>")
+    msg = "<div class=ok>✓ নতুন ট্র্যাকিং লিংক তৈরি হয়েছে — তালিকা থেকে কপি করে শেয়ার করো</div>" if "made=1" in env.get("QUERY_STRING", "") else ""
+    return html_resp(page("Dashboard", f"""<div class=wrap>
 <header><div class=logo>🔗 <b>SB</b> Link Tracker</div><a class=btn href=/logout>লগআউট</a></header>
 {msg}
 <div class=stats>
@@ -201,25 +234,66 @@ class H(BaseHTTPRequestHandler):
 <div class=card><h3>📊 সাম্প্রতিক ক্লিক</h3><div class=tbl><table><tr><th>সময় (UTC)</th><th>লিংক</th><th>IP</th><th>দেশ/শহর</th><th>ISP</th><th>ব্রাউজার</th><th>OS</th></tr>{rows or '<tr><td colspan=7>এখনো কোনো ক্লিক নেই</td></tr>'}</table></div></div>
 <footer>শিক্ষামূলক / নিজের লিংকের অ্যানালিটিক্সের জন্য · IP দিয়ে আনুমানিক দেশ/শহর পাওয়া যায়, সঠিক GPS নয় · SB Digital Studio</footer>
 </div><script>{JS}</script>"""))
-        return self.send_html(page("404", "<div class=wrap><div class=card><h3>পেজ পাওয়া যায়নি</h3></div></div>"), 404)
 
-    def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == "/login":
-            pw = self.form().get("password", [""])[0]
-            if ADMIN_KEY and hmac.compare_digest(pw, ADMIN_KEY):
-                return self.redirect("/", {"Set-Cookie": f"sb_session={make_token()}; Path=/; HttpOnly; SameSite=Lax"})
-            return self.redirect("/login?e=1")
-        if path == "/create":
-            if not self.session(): return self.redirect("/login")
-            url = self.form().get("url", [""])[0].strip()
+def application(env, start_response):
+    method = env.get("REQUEST_METHOD", "GET")
+    path = env.get("PATH_INFO", "/") or "/"
+    status, headers, body = "404 Not Found", [("Content-Type", "text/plain")], [b"Not found"]
+    if path.startswith("/api/"):
+        status, headers, body = api_handle(env, method, path)
+        start_response(status, headers)
+        return body
+    if method == "GET" and path.startswith("/t/"):
+        code = path[3:].strip("/")
+        c = db(); row = c.execute("SELECT url FROM links WHERE code=?", (code,)).fetchone()
+        if not row:
+            c.close(); status, headers, body = html_resp(page("Not found", "<div class=wrap><div class=card><h3>লিংক পাওয়া যায়নি</h3></div></div>"), "404 Not Found")
+        else:
+            ip = (env.get("HTTP_CF_CONNECTING_IP", "").strip()
+                  or (env.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip())
+                  or env.get("REMOTE_ADDR", ""))
+            ua = env.get("HTTP_USER_AGENT", ""); br, os_ = parse_ua(ua)
+            country, city, isp = geo(ip)
+            c.execute("INSERT INTO clicks(code,ts,ip,country,city,isp,browser,os,ua,referer) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (code, datetime.now(timezone.utc).isoformat(), ip, country, city, isp, br, os_, ua, env.get("HTTP_REFERER", "")))
+            c.commit(); c.close()
+            status, headers, body = redirect_resp(row["url"])
+    elif method == "GET" and path == "/login":
+        if get_session(env):
+            status, headers, body = redirect_resp("/")
+        else:
+            status, headers, body = login_page(env)
+    elif method == "GET" and path == "/logout":
+        status, headers, body = redirect_resp("/login", [("Set-Cookie", "sb_session=; Path=/; Max-Age=0; HttpOnly")])
+    elif method == "GET" and path in ("/", "/dashboard"):
+        if not admin_key():
+            status, headers, body = login_page(env)
+        elif not get_session(env):
+            status, headers, body = redirect_resp("/login")
+        else:
+            status, headers, body = dashboard(env)
+    elif method == "POST" and path == "/login":
+        pw = read_form(env).get("password", [""])[0]
+        if admin_key() and hmac.compare_digest(pw, admin_key()):
+            status, headers, body = redirect_resp("/", [("Set-Cookie", f"sb_session={make_token()}; Path=/; HttpOnly; SameSite=Lax")])
+        else:
+            status, headers, body = redirect_resp("/login?e=1")
+    elif method == "POST" and path == "/create":
+        if not get_session(env):
+            status, headers, body = redirect_resp("/login")
+        else:
+            url = read_form(env).get("url", [""])[0].strip()
             if not url.startswith(("http://", "https://")):
-                return self.send_html(page("Error", "<div class=wrap><div class=card><h3>সঠিক http/https লিংক দাও</h3><p><a href='/'>ফিরে যাও</a></p></div></div>"), 400)
-            code = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(6))
-            c = db(); c.execute("INSERT INTO links VALUES(?,?,?)", (code, url, datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
-            return self.redirect("/?made=1")
-        return self.send_html("Not found", 404)
+                status, headers, body = html_resp(page("Error", "<div class=wrap><div class=card><h3>সঠিক http/https লিংক দাও</h3><p><a href='/'>ফিরে যাও</a></p></div></div>"), "400 Bad Request")
+            else:
+                code = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(6))
+                c = db(); c.execute("INSERT INTO links VALUES(?,?,?)", (code, url, datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
+                status, headers, body = redirect_resp("/?made=1")
+    start_response(status, headers)
+    return body
 
 if __name__ == "__main__":
-    db().close(); print(f"SB Link Tracker v3 on http://127.0.0.1:{PORT} (password gate: {'ON' if ADMIN_KEY else 'OFF - set ADMIN_KEY'})")
-    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+    from wsgiref.simple_server import make_server
+    db().close()
+    print(f"SB Link Tracker v4 on http://127.0.0.1:{PORT} (password gate: {'ON' if admin_key() else 'OFF - set ADMIN_KEY'})")
+    make_server("0.0.0.0", PORT, application).serve_forever()
